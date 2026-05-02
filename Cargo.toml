@@ -125,7 +125,7 @@ email_address = "0.2.9"
 handlebars = { version = "6.2.0", features = ["dir_source"] }
 
 # HTTP client (Used for favicons, version check, DUO and HIBP API)
-reqwest = { version = "0.12.9", features = ["native-tls-alpn", "stream", "json", "gzip", "brotli", "socks", "cookies"] }
+reqwest = { version = "0.12.9", features = ["native-tls-alpn", "stream", "json", "gzip", "brotli", "socks", "cookies", "multipart"] }
 hickory-resolver = "0.24.1"
 
 # Favicon extraction libraries

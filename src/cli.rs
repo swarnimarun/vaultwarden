@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     ffi::OsString,
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
     path::{Path, PathBuf},
     process::exit,
     sync::Arc,
@@ -19,7 +19,7 @@ use data_encoding::{BASE64, HEXLOWER};
 use openssl::{
     pkey::PKey,
     rsa::{Padding, Rsa},
-    symm::{decrypt, Cipher},
+    symm::{decrypt, encrypt, Cipher},
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -30,6 +30,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use reqwest::header::AUTHORIZATION;
+use reqwest::multipart::{Form, Part};
 use ring::{
     digest::{Context, SHA256},
     hkdf, hmac, pbkdf2,
@@ -42,7 +43,7 @@ use tokio::{
 };
 use totp_lite::{totp_custom, Sha1, Sha256, Sha512};
 
-use crate::{Error, MapResult, VERSION};
+use crate::{crypto, Error, MapResult, VERSION};
 
 const DEVICE_TYPE_SDK: &str = "21";
 const PBKDF2_OUTPUT_LEN: usize = 32;
@@ -64,6 +65,10 @@ pub const DUMP_HELP: &str = "\
     fetch  --server <url> --client-id <user.uuid> --client-secret <secret> --query <text>
                                        Print or export decrypted item details and attachments
                                        Flags: [--domain|--name|--all] [--json] [--out <dir>]
+                                              [--master-password <value>]
+    upload --server <url> --client-id <user.uuid> --client-secret <secret> --input <dump-dir>
+                                       Upload a decrypted dump into another account
+                                       Flags: [--diagnostics] [--skip-attachments]
                                               [--master-password <value>]
     tui    --server <url> --client-id <user.uuid> --client-secret <secret>
                                        Start a simple search-first terminal UI
@@ -113,6 +118,15 @@ struct FetchArgs {
     master_password: Option<String>,
     json: bool,
     out_dir: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct UploadArgs {
+    common: CommonArgs,
+    input_dir: PathBuf,
+    master_password: Option<String>,
+    diagnostics: bool,
+    skip_attachments: bool,
 }
 
 #[derive(Debug)]
@@ -175,7 +189,7 @@ struct AttachmentIndexEntry {
     checksum_sha256: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedAttachmentIndexEntry {
     cipher_id: String,
     attachment_id: String,
@@ -203,13 +217,13 @@ struct AccountKeys {
     org_keys: HashMap<String, Arc<SymmetricKey>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedFolder {
     id: String,
     name: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedField {
     name: Option<String>,
     value: Option<String>,
@@ -218,30 +232,30 @@ struct DecryptedField {
     linked_id: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedPasswordHistory {
     password: Option<String>,
     last_used_date: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedUri {
     uri: Option<String>,
     match_type: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedAttachment {
     id: String,
     file_name: String,
     size: Option<String>,
     url: String,
     mime: Option<String>,
-    #[serde(skip_serializing)]
+    #[serde(default, skip)]
     key: Option<SymmetricKey>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedLogin {
     username: Option<String>,
     password: Option<String>,
@@ -250,7 +264,7 @@ struct DecryptedLogin {
     password_history: Vec<DecryptedPasswordHistory>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedCard {
     cardholder_name: Option<String>,
     brand: Option<String>,
@@ -260,7 +274,7 @@ struct DecryptedCard {
     code: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedIdentity {
     title: Option<String>,
     first_name: Option<String>,
@@ -282,19 +296,19 @@ struct DecryptedIdentity {
     license_number: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedSecureNote {
     note_type: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedSshKey {
     private_key: Option<String>,
     public_key: Option<String>,
     fingerprint: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedCipher {
     id: String,
     r#type: i64,
@@ -314,13 +328,13 @@ struct DecryptedCipher {
     identity: Option<DecryptedIdentity>,
     secure_note: Option<DecryptedSecureNote>,
     ssh_key: Option<DecryptedSshKey>,
-    #[serde(skip_serializing)]
+    #[serde(default, skip)]
     search_blob: String,
-    #[serde(skip_serializing)]
+    #[serde(default, skip)]
     search_domains: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct DecryptedExport {
     encrypted: bool,
     folders: Vec<DecryptedFolder>,
@@ -363,6 +377,12 @@ struct FetchAttachmentResult {
     mime: Option<String>,
 }
 
+#[derive(Debug)]
+struct UploadSource {
+    export: DecryptedExport,
+    attachment_index: HashMap<(String, String), DecryptedAttachmentIndexEntry>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TuiFocus {
     Search,
@@ -383,6 +403,97 @@ enum TotpAlgorithm {
     Sha256,
     Sha512,
     Unsupported(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DuplicateDecision {
+    Allow,
+    KeepExisting,
+    KeepIncoming,
+}
+
+impl DuplicateDecision {
+    fn label(self) -> &'static str {
+        match self {
+            DuplicateDecision::Allow => "allow",
+            DuplicateDecision::KeepExisting => "keep-existing",
+            DuplicateDecision::KeepIncoming => "keep-incoming",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DiagnosticsEntry {
+    source_name: String,
+    source_id: String,
+    source_json: Value,
+    existing_id: Option<String>,
+    existing_name: Option<String>,
+    existing_json: Option<Value>,
+    decision: String,
+    action: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DiagnosticsReport {
+    total_items: usize,
+    created: usize,
+    skipped: usize,
+    updated: usize,
+    trashed: usize,
+    conflicts: Vec<DiagnosticsEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UploadMode {
+    Skip,
+    Create,
+    Replace,
+}
+
+#[derive(Clone, Debug)]
+struct UploadPlanItem {
+    source: DecryptedCipher,
+    target_folder_id: Option<String>,
+    mode: UploadMode,
+    target_cipher: Option<DecryptedCipher>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DuplicatePickerFocus {
+    Source,
+    Target,
+    Details,
+}
+
+#[derive(Clone, Debug)]
+struct DuplicatePickerState {
+    source_selected: usize,
+    target_selected: usize,
+    focus: DuplicatePickerFocus,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ValidationCipher {
+    r#type: i64,
+    name: String,
+    notes: Option<String>,
+    favorite: Option<bool>,
+    folder_id: Option<String>,
+    deleted: bool,
+    fields: Vec<CanonicalUploadField>,
+    login: Option<CanonicalUploadLogin>,
+    card: Option<CanonicalUploadCard>,
+    identity: Option<CanonicalUploadIdentity>,
+    secure_note: Option<CanonicalUploadSecureNote>,
+    ssh_key: Option<CanonicalUploadSshKey>,
+    attachments: Vec<CanonicalUploadAttachment>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachmentRestoreMode {
+    Enforce,
+    SkipValidation,
 }
 
 #[derive(Clone, Debug)]
@@ -423,6 +534,12 @@ pub async fn handle_command(command: &str, pargs: &mut pico_args::Arguments) -> 
             let args = parse_fetch_args(pargs)?;
             ensure_consumed(pargs)?;
             run_fetch(args).await?;
+            exit(0);
+        }
+        "upload" => {
+            let args = parse_upload_args(pargs)?;
+            ensure_consumed(pargs)?;
+            run_upload(args).await?;
             exit(0);
         }
         "tui" => {
@@ -527,6 +644,22 @@ fn parse_fetch_args(pargs: &mut pico_args::Arguments) -> Result<FetchArgs, Error
         master_password: parse_master_password_arg(pargs)?,
         json: pargs.contains("--json"),
         out_dir,
+    })
+}
+
+fn parse_upload_args(pargs: &mut pico_args::Arguments) -> Result<UploadArgs, Error> {
+    let common = parse_common_args(pargs)?;
+    let input_dir = pargs
+        .opt_value_from_str::<_, PathBuf>("--input")
+        .map_err(|e| Error::new("Invalid --input argument", e.to_string()))?
+        .map_res("Missing required argument --input")?;
+
+    Ok(UploadArgs {
+        common,
+        input_dir,
+        master_password: parse_master_password_arg(pargs)?,
+        diagnostics: pargs.contains("--diagnostics"),
+        skip_attachments: pargs.contains("--skip-attachments"),
     })
 }
 
@@ -710,6 +843,1423 @@ async fn run_fetch(args: FetchArgs) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+async fn run_upload(args: UploadArgs) -> Result<(), Error> {
+    log_info("upload", &args.common, format!("Starting vault upload from {}", args.input_dir.display()));
+
+    let source = load_upload_source(&args.input_dir).await?;
+    let bundle = login_and_fetch_sync(args.common.clone(), false).await?;
+    let master_password = resolve_master_password(args.master_password, "Master password: ")?;
+    let keys = derive_account_keys(&bundle, &master_password, &args.common)?;
+    let target_export = decrypt_export_lossy(&bundle.sync, &keys, &args.common);
+
+    let target_folder_map =
+        ensure_target_folders(&bundle.session, &source.export.folders, &target_export.folders).await?;
+    let source_folder_names = folder_name_map(&source.export.folders);
+    let mut existing_signatures = build_existing_signatures(&target_export, &target_export.folders);
+
+    log_info("upload", &args.common, format!(
+        "Loaded {} items and {} folders from source dump",
+        source.export.items.len(),
+        source.export.folders.len()
+    ));
+
+    for item in &source.export.items {
+        if item.organization_id.is_some() {
+            return Err(Error::new(
+                "Organization-owned items are not supported by upload",
+                format!("item={} id={}", item.name, item.id),
+            ));
+        }
+    }
+
+    let source_items = resolve_source_duplicates(&source.export.items, &source_folder_names, &args.common)?;
+    let mut upload_plan = Vec::with_capacity(source_items.len());
+    for item in source_items {
+        let source_folder_name =
+            item.folder_id.as_ref().and_then(|folder_id| source_folder_names.get(folder_id)).cloned();
+        let target_folder_id =
+            source_folder_name.as_ref().and_then(|folder_name| target_folder_map.get(folder_name)).cloned();
+        let source_signature = build_duplicate_signature(&item, source_folder_name.as_deref());
+        let target_matches = existing_signatures.get(&source_signature).cloned().unwrap_or_default();
+        let (mode, target_cipher) = if target_matches.is_empty() {
+            (UploadMode::Create, None)
+        } else {
+            resolve_target_duplicate(&item, &target_matches, &args.common)?
+        };
+        upload_plan.push(UploadPlanItem {
+            source: item,
+            target_folder_id,
+            mode,
+            target_cipher,
+        });
+    }
+
+    let mut created = 0usize;
+    let mut skipped = 0usize;
+    let mut updated = 0usize;
+    let mut trashed = 0usize;
+    let mut diagnostics_entries = Vec::new();
+    let mut skip_attachment_uploads = args.skip_attachments;
+
+    for plan_item in upload_plan {
+        let upload_item = prepare_upload_item(&plan_item.source, plan_item.target_folder_id.clone(), &keys.user_key);
+        verify_prepared_upload_item(&upload_item)?;
+        let existing_opt = plan_item.target_cipher.clone();
+        let decision = match plan_item.mode {
+            UploadMode::Skip => DuplicateDecision::KeepExisting,
+            UploadMode::Create => DuplicateDecision::Allow,
+            UploadMode::Replace => DuplicateDecision::KeepIncoming,
+        };
+
+        let diag_existing = existing_opt
+            .as_ref()
+            .map(|ex| (ex.id.clone(), ex.name.clone(), serde_json::to_value(ex).unwrap_or_default()));
+
+        if args.diagnostics {
+            let action = match decision {
+                DuplicateDecision::Allow => "created",
+                DuplicateDecision::KeepExisting => "kept-existing",
+                DuplicateDecision::KeepIncoming => "updated",
+            };
+            let source_owned = upload_item.source.clone();
+            diagnostics_entries.push(DiagnosticsEntry {
+                source_name: source_owned.name.clone(),
+                source_id: source_owned.id.clone(),
+                source_json: serde_json::to_value(&source_owned).unwrap_or_default(),
+                existing_id: diag_existing.as_ref().map(|(id, _, _)| id.clone()),
+                existing_name: diag_existing.as_ref().map(|(_, name, _)| name.clone()),
+                existing_json: diag_existing.map(|(_, _, json)| json),
+                decision: decision.label().to_string(),
+                action: action.to_string(),
+            });
+        }
+
+        match (plan_item.mode, existing_opt.as_ref()) {
+            (UploadMode::Skip, _) => {
+                skipped += 1;
+                log_info("upload", &args.common, format!("Skipped {}", upload_item.name));
+            }
+            (UploadMode::Create, _) => {
+                let cipher_id = upload_cipher(&bundle.session, &upload_item).await?;
+                let mut attachment_mode = if skip_attachment_uploads {
+                    AttachmentRestoreMode::SkipValidation
+                } else {
+                    AttachmentRestoreMode::Enforce
+                };
+                if !skip_attachment_uploads {
+                    match upload_cipher_attachments(
+                        &bundle.session,
+                        &cipher_id,
+                        &upload_item,
+                        &source.attachment_index,
+                        &args.input_dir,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(err) => {
+                            if prompt_skip_attachments_on_error(&upload_item.name, &err)? {
+                                skip_attachment_uploads = true;
+                                attachment_mode = AttachmentRestoreMode::SkipValidation;
+                                log_info(
+                                    "upload",
+                                    &args.common,
+                                    format!("Skipping attachment uploads after failure on {}", upload_item.name),
+                                );
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
+
+                if upload_item.deleted_date.is_some() {
+                    soft_delete_cipher(&bundle.session, &cipher_id).await?;
+                    trashed += 1;
+                }
+
+                let verified = verify_uploaded_cipher_with_attachment_prompt(
+                    &bundle.session,
+                    &keys,
+                    &upload_item,
+                    &cipher_id,
+                    &mut attachment_mode,
+                )
+                .await?;
+                insert_existing_signature(&mut existing_signatures, verified);
+                created += 1;
+                log_info("upload", &args.common, format!("Created {} (id={})", upload_item.name, cipher_id));
+            }
+            (UploadMode::Replace, Some(existing_item)) => {
+                let mut attachment_mode = if skip_attachment_uploads {
+                    AttachmentRestoreMode::SkipValidation
+                } else {
+                    AttachmentRestoreMode::Enforce
+                };
+                if let Err(err) = update_cipher(&bundle.session, existing_item, &upload_item).await {
+                    if error_indicates_missing_cipher(&err) {
+                        log_info(
+                            "upload",
+                            &args.common,
+                            format!(
+                                "Target cipher {} disappeared while updating {}; creating a new item instead",
+                                existing_item.id, upload_item.name
+                            ),
+                        );
+                        let cipher_id = upload_cipher(&bundle.session, &upload_item).await?;
+                        if !skip_attachment_uploads {
+                            match upload_cipher_attachments(
+                                &bundle.session,
+                                &cipher_id,
+                                &upload_item,
+                                &source.attachment_index,
+                                &args.input_dir,
+                            )
+                            .await
+                            {
+                                Ok(()) => {}
+                            Err(err) => {
+                                if prompt_skip_attachments_on_error(&upload_item.name, &err)? {
+                                    skip_attachment_uploads = true;
+                                    attachment_mode = AttachmentRestoreMode::SkipValidation;
+                                    log_info(
+                                        "upload",
+                                        &args.common,
+                                        format!("Skipping attachment uploads after failure on {}", upload_item.name),
+                                    );
+                                    } else {
+                                        return Err(err);
+                                    }
+                                }
+                            }
+                        }
+                        if upload_item.deleted_date.is_some() {
+                            soft_delete_cipher(&bundle.session, &cipher_id).await?;
+                            trashed += 1;
+                        }
+                        let verified = verify_uploaded_cipher_with_attachment_prompt(
+                            &bundle.session,
+                            &keys,
+                            &upload_item,
+                            &cipher_id,
+                            &mut attachment_mode,
+                        )
+                        .await?;
+                        replace_existing_signature(&mut existing_signatures, &existing_item.id, verified);
+                        created += 1;
+                        log_info("upload", &args.common, format!("Created {} (id={})", upload_item.name, cipher_id));
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if !skip_attachment_uploads {
+                    match reconcile_cipher_attachments(
+                        &bundle.session,
+                        &upload_item,
+                        existing_item,
+                        &source.attachment_index,
+                        &args.input_dir,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(err) => {
+                            if prompt_skip_attachments_on_error(&upload_item.name, &err)? {
+                                skip_attachment_uploads = true;
+                                attachment_mode = AttachmentRestoreMode::SkipValidation;
+                                log_info(
+                                    "upload",
+                                    &args.common,
+                                    format!("Skipping attachment uploads after failure on {}", upload_item.name),
+                                );
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
+                if upload_item.deleted_date.is_some() {
+                    soft_delete_cipher(&bundle.session, &existing_item.id).await?;
+                    trashed += 1;
+                } else if existing_item.deleted_date.is_some() {
+                    restore_cipher(&bundle.session, &existing_item.id).await?;
+                }
+                let verified = verify_uploaded_cipher_with_attachment_prompt(
+                    &bundle.session,
+                    &keys,
+                    &upload_item,
+                    &existing_item.id,
+                    &mut attachment_mode,
+                )
+                .await?;
+                replace_existing_signature(&mut existing_signatures, &existing_item.id, verified);
+                updated += 1;
+                log_info("upload", &args.common, format!("Updated {} -> {}", upload_item.name, existing_item.id));
+            }
+            (UploadMode::Replace, None) => {
+                skipped += 1;
+                log_verbose(
+                    "upload",
+                    &args.common,
+                    format!("Replace mode chosen for {} but no target cipher exists", upload_item.name),
+                );
+            }
+        }
+    }
+
+    if args.diagnostics {
+        let report = DiagnosticsReport {
+            total_items: source.export.items.len(),
+            created,
+            skipped,
+            updated,
+            trashed,
+            conflicts: diagnostics_entries,
+        };
+        let report_json =
+            serde_json::to_string_pretty(&report).map_res("Failed to format diagnostics report")?;
+        eprintln!("\n[upload] diagnostics report:\n{report_json}");
+    }
+
+    log_info(
+        "upload",
+        &args.common,
+        format!("Completed upload: created={created} updated={updated} skipped={skipped} trashed={trashed}"),
+    );
+    Ok(())
+}
+
+fn error_indicates_missing_cipher(err: &Error) -> bool {
+    let text = format!("{err}");
+    text.contains("Cipher doesn't exist")
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CanonicalUploadCipher {
+    #[serde(rename = "type")]
+    r#type: i64,
+    name: String,
+    notes: Option<String>,
+    favorite: Option<bool>,
+    folder: Option<String>,
+    deleted: bool,
+    fields: Vec<CanonicalUploadField>,
+    login: Option<CanonicalUploadLogin>,
+    card: Option<CanonicalUploadCard>,
+    identity: Option<CanonicalUploadIdentity>,
+    secure_note: Option<CanonicalUploadSecureNote>,
+    ssh_key: Option<CanonicalUploadSshKey>,
+    attachments: Vec<CanonicalUploadAttachment>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CanonicalUploadField {
+    name: Option<String>,
+    value: Option<String>,
+    #[serde(rename = "type")]
+    field_type: Option<i64>,
+    linked_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CanonicalUploadLogin {
+    username: Option<String>,
+    password: Option<String>,
+    totp: Option<String>,
+    uris: Vec<CanonicalUploadUri>,
+    password_history: Vec<CanonicalUploadPasswordHistory>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CanonicalUploadUri {
+    uri: Option<String>,
+    match_type: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CanonicalUploadPasswordHistory {
+    password: Option<String>,
+    last_used_date: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CanonicalUploadCard {
+    cardholder_name: Option<String>,
+    brand: Option<String>,
+    number: Option<String>,
+    exp_month: Option<String>,
+    exp_year: Option<String>,
+    code: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CanonicalUploadIdentity {
+    title: Option<String>,
+    first_name: Option<String>,
+    middle_name: Option<String>,
+    last_name: Option<String>,
+    address1: Option<String>,
+    address2: Option<String>,
+    address3: Option<String>,
+    city: Option<String>,
+    state: Option<String>,
+    postal_code: Option<String>,
+    country: Option<String>,
+    company: Option<String>,
+    email: Option<String>,
+    phone: Option<String>,
+    ssn: Option<String>,
+    username: Option<String>,
+    passport_number: Option<String>,
+    license_number: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CanonicalUploadSecureNote {
+    note_type: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CanonicalUploadSshKey {
+    private_key: Option<String>,
+    public_key: Option<String>,
+    fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CanonicalUploadAttachment {
+    file_name: String,
+    size: Option<String>,
+}
+
+#[derive(Debug)]
+struct PreparedUploadItem {
+    name: String,
+    deleted_date: Option<String>,
+    payload: Value,
+    item_key: SymmetricKey,
+    source: DecryptedCipher,
+    attachments: Vec<DecryptedAttachment>,
+}
+
+fn prepare_upload_item(
+    item: &DecryptedCipher,
+    folder_id: Option<String>,
+    target_key: &SymmetricKey,
+) -> PreparedUploadItem {
+    let item_key = generate_random_symmetric_key();
+    let fields = encrypt_fields(&item.fields, &item_key);
+    let login = encrypt_login(item.login.as_ref(), &item_key);
+    let card = encrypt_card(item.card.as_ref(), &item_key);
+    let identity = encrypt_identity(item.identity.as_ref(), &item_key);
+    let ssh_key = encrypt_ssh_key(item.ssh_key.as_ref(), &item_key);
+    let secure_note = encrypt_secure_note(item.secure_note.as_ref());
+    let notes = item.notes.as_deref().map(|value| encrypt_string_value(value, &item_key));
+    let name = encrypt_string_value(&item.name, &item_key);
+    let key = encrypt_string_value_raw(&item_key.to_bytes(), target_key);
+    let attachments = item.attachments.clone();
+
+    let payload = json!({
+        "type": item.r#type,
+        "name": name,
+        "notes": notes,
+        "favorite": item.favorite,
+        "folderId": folder_id,
+        "organizationId": Value::Null,
+        "key": key,
+        "fields": fields,
+        "login": login,
+        "card": card,
+        "identity": identity,
+        "secureNote": secure_note,
+        "sshKey": ssh_key,
+        "passwordHistory": encrypt_password_history(item.login.as_ref(), &item_key),
+        "reprompt": Value::Null,
+        "lastKnownRevisionDate": Value::Null,
+    });
+
+    PreparedUploadItem {
+        name: item.name.clone(),
+        deleted_date: item.deleted_date.clone(),
+        payload,
+        item_key,
+        source: item.clone(),
+        attachments,
+    }
+}
+
+async fn load_upload_source(input_dir: &Path) -> Result<UploadSource, Error> {
+    let vault_path = input_dir.join("decrypted").join("vault.json");
+    let vault_bytes = fs::read(&vault_path)
+        .await
+        .map_err(|e| Error::new(format!("Failed to read {}", vault_path.display()), e.to_string()))?;
+    let mut export: DecryptedExport =
+        serde_json::from_slice(&vault_bytes).map_res("Failed to parse decrypted vault export")?;
+    export.items.iter_mut().for_each(normalize_loaded_cipher);
+
+    let attachment_index_path = input_dir.join("decrypted").join("attachments-index.json");
+    let attachment_index =
+        if fs::try_exists(&attachment_index_path).await.map_res("Failed to probe decrypted attachment index")? {
+            let bytes = fs::read(&attachment_index_path).await.map_res("Failed to read decrypted attachment index")?;
+            let entries: Vec<DecryptedAttachmentIndexEntry> =
+                serde_json::from_slice(&bytes).map_res("Failed to parse decrypted attachment index")?;
+            entries
+                .into_iter()
+                .map(|entry| ((entry.cipher_id.clone(), entry.attachment_id.clone()), entry))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+
+    Ok(UploadSource {
+        export,
+        attachment_index,
+    })
+}
+
+fn normalize_loaded_cipher(item: &mut DecryptedCipher) {
+    if item.login.as_ref().is_some_and(login_is_empty) {
+        item.login = None;
+    }
+    if item.card.as_ref().is_some_and(card_is_empty) {
+        item.card = None;
+    }
+    if item.identity.as_ref().is_some_and(identity_is_empty) {
+        item.identity = None;
+    }
+    if item.secure_note.as_ref().is_some_and(secure_note_is_empty) {
+        item.secure_note = None;
+    }
+    if item.ssh_key.as_ref().is_some_and(ssh_key_is_empty) {
+        item.ssh_key = None;
+    }
+
+    match item.r#type {
+        1 => {
+            item.card = None;
+            item.identity = None;
+            item.secure_note = None;
+            item.ssh_key = None;
+        }
+        2 => {
+            item.login = None;
+            item.card = None;
+            item.identity = None;
+            item.ssh_key = None;
+        }
+        3 => {
+            item.login = None;
+            item.identity = None;
+            item.secure_note = None;
+            item.ssh_key = None;
+        }
+        4 => {
+            item.login = None;
+            item.card = None;
+            item.secure_note = None;
+            item.ssh_key = None;
+        }
+        5 => {
+            item.login = None;
+            item.card = None;
+            item.identity = None;
+            item.secure_note = None;
+        }
+        _ => {}
+    }
+}
+
+fn login_is_empty(login: &DecryptedLogin) -> bool {
+    login.username.is_none()
+        && login.password.is_none()
+        && login.totp.is_none()
+        && login.uris.is_empty()
+        && login.password_history.is_empty()
+}
+
+fn card_is_empty(card: &DecryptedCard) -> bool {
+    card.cardholder_name.is_none()
+        && card.brand.is_none()
+        && card.number.is_none()
+        && card.exp_month.is_none()
+        && card.exp_year.is_none()
+        && card.code.is_none()
+}
+
+fn identity_is_empty(identity: &DecryptedIdentity) -> bool {
+    identity.title.is_none()
+        && identity.first_name.is_none()
+        && identity.middle_name.is_none()
+        && identity.last_name.is_none()
+        && identity.address1.is_none()
+        && identity.address2.is_none()
+        && identity.address3.is_none()
+        && identity.city.is_none()
+        && identity.state.is_none()
+        && identity.postal_code.is_none()
+        && identity.country.is_none()
+        && identity.company.is_none()
+        && identity.email.is_none()
+        && identity.phone.is_none()
+        && identity.ssn.is_none()
+        && identity.username.is_none()
+        && identity.passport_number.is_none()
+        && identity.license_number.is_none()
+}
+
+fn secure_note_is_empty(note: &DecryptedSecureNote) -> bool {
+    note.note_type.is_none()
+}
+
+fn ssh_key_is_empty(ssh_key: &DecryptedSshKey) -> bool {
+    ssh_key.private_key.is_none() && ssh_key.public_key.is_none() && ssh_key.fingerprint.is_none()
+}
+
+async fn ensure_target_folders(
+    session: &Session,
+    source_folders: &[DecryptedFolder],
+    target_folders: &[DecryptedFolder],
+) -> Result<HashMap<String, String>, Error> {
+    let mut target_by_name =
+        target_folders.iter().map(|folder| (folder.name.clone(), folder.id.clone())).collect::<HashMap<_, _>>();
+    let mut source_to_target = HashMap::new();
+
+    for folder in source_folders {
+        let target_id = if let Some(existing) = target_by_name.get(&folder.name) {
+            existing.clone()
+        } else {
+            let response = post_json(
+                session,
+                &format!("{}/api/folders", session.common.server),
+                &json!({ "name": folder.name }),
+                "upload",
+            )
+            .await?;
+            let created: Value = response.json().await.map_res("Failed to parse created folder response")?;
+            let id = created
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .map_res("Created folder response missing id")?;
+            target_by_name.insert(folder.name.clone(), id.clone());
+            id
+        };
+        source_to_target.insert(folder.id.clone(), target_id);
+    }
+
+    Ok(source_to_target)
+}
+
+fn folder_name_map(folders: &[DecryptedFolder]) -> HashMap<String, String> {
+    folders.iter().map(|folder| (folder.id.clone(), folder.name.clone())).collect()
+}
+
+fn build_existing_signatures(
+    export: &DecryptedExport,
+    target_folders: &[DecryptedFolder],
+) -> HashMap<String, Vec<DecryptedCipher>> {
+    let target_folder_names = folder_name_map(target_folders);
+    let mut signatures = HashMap::<String, Vec<DecryptedCipher>>::new();
+    for item in &export.items {
+        let folder_name = item.folder_id.as_ref().and_then(|folder_id| target_folder_names.get(folder_id)).cloned();
+        signatures
+            .entry(build_duplicate_signature(item, folder_name.as_deref()))
+            .or_default()
+            .push(item.clone());
+    }
+    signatures
+}
+
+fn insert_existing_signature(signatures: &mut HashMap<String, Vec<DecryptedCipher>>, item: DecryptedCipher) {
+    signatures
+        .entry(build_duplicate_signature(&item, None))
+        .or_default()
+        .push(item);
+}
+
+fn replace_existing_signature(
+    signatures: &mut HashMap<String, Vec<DecryptedCipher>>,
+    target_id: &str,
+    replacement: DecryptedCipher,
+) {
+    for values in signatures.values_mut() {
+        values.retain(|item| item.id != target_id);
+    }
+    insert_existing_signature(signatures, replacement);
+}
+
+fn build_duplicate_signature(item: &DecryptedCipher, folder_name_override: Option<&str>) -> String {
+    let signature = CanonicalUploadCipher {
+        r#type: item.r#type,
+        name: item.name.clone(),
+        notes: item.notes.clone(),
+        favorite: item.favorite,
+        folder: folder_name_override.map(str::to_owned),
+        deleted: item.deleted_date.is_some(),
+        fields: canonical_fields(&item.fields),
+        login: item.login.as_ref().map(canonical_login),
+        card: item.card.as_ref().map(canonical_card),
+        identity: item.identity.as_ref().map(canonical_identity),
+        secure_note: item.secure_note.as_ref().map(canonical_secure_note),
+        ssh_key: item.ssh_key.as_ref().map(canonical_ssh_key),
+        attachments: canonical_attachments(&item.attachments),
+    };
+
+    serde_json::to_string(&signature).unwrap_or_else(|_| item.id.clone())
+}
+
+fn resolve_source_duplicates(
+    items: &[DecryptedCipher],
+    folder_names: &HashMap<String, String>,
+    common: &CommonArgs,
+) -> Result<Vec<DecryptedCipher>, Error> {
+    let mut grouped = HashMap::<String, Vec<DecryptedCipher>>::new();
+    for item in items {
+        let folder_name = item.folder_id.as_ref().and_then(|folder_id| folder_names.get(folder_id)).cloned();
+        grouped
+            .entry(build_duplicate_signature(item, folder_name.as_deref()))
+            .or_default()
+            .push(item.clone());
+    }
+
+    let mut resolved = Vec::with_capacity(items.len());
+    for group in grouped.into_values() {
+        if group.len() == 1 {
+            resolved.extend(group);
+        } else {
+            resolved.push(resolve_source_duplicate_group(&group, common)?);
+        }
+    }
+    Ok(resolved)
+}
+
+fn resolve_source_duplicate_group(items: &[DecryptedCipher], common: &CommonArgs) -> Result<DecryptedCipher, Error> {
+    log_verbose(
+        "upload",
+        common,
+        format!("Resolving {} duplicate source items", items.len()),
+    );
+    let mut terminal = setup_tui_terminal()?;
+    let _guard = TuiTerminalGuard;
+    let mut selected = 0usize;
+
+    loop {
+        terminal
+            .draw(|frame| render_source_duplicate_picker(frame, items, selected))
+            .map_res("Failed to render source duplicate picker")?;
+
+        if !event::poll(Duration::from_millis(250)).map_res("Failed to poll duplicate picker events")? {
+            continue;
+        }
+
+        let Event::Key(key) = event::read().map_res("Failed to read duplicate picker event")? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(items.len().saturating_sub(1));
+            }
+            KeyCode::Enter => return Ok(items[selected].clone()),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                return Err(Error::new("Duplicate selection aborted", "source duplicate resolution cancelled"));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn resolve_target_duplicate(
+    source: &DecryptedCipher,
+    targets: &[DecryptedCipher],
+    common: &CommonArgs,
+) -> Result<(UploadMode, Option<DecryptedCipher>), Error> {
+    log_verbose(
+        "upload",
+        common,
+        format!("Resolving target duplicate for {} against {} candidates", source.name, targets.len()),
+    );
+
+    let mut terminal = setup_tui_terminal()?;
+    let _guard = TuiTerminalGuard;
+    let mut state = DuplicatePickerState {
+        source_selected: 0,
+        target_selected: 0,
+        focus: DuplicatePickerFocus::Source,
+    };
+    let sources = vec![source.clone()];
+
+    loop {
+        terminal
+            .draw(|frame| render_target_duplicate_picker(frame, &sources, targets, &state))
+            .map_res("Failed to render target duplicate picker")?;
+
+        if !event::poll(Duration::from_millis(250)).map_res("Failed to poll duplicate picker events")? {
+            continue;
+        }
+
+        let Event::Key(key) = event::read().map_res("Failed to read duplicate picker event")? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Tab | KeyCode::Right => {
+                state.focus = match state.focus {
+                    DuplicatePickerFocus::Source => DuplicatePickerFocus::Target,
+                    DuplicatePickerFocus::Target => DuplicatePickerFocus::Details,
+                    DuplicatePickerFocus::Details => DuplicatePickerFocus::Source,
+                };
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                state.focus = match state.focus {
+                    DuplicatePickerFocus::Source => DuplicatePickerFocus::Details,
+                    DuplicatePickerFocus::Target => DuplicatePickerFocus::Source,
+                    DuplicatePickerFocus::Details => DuplicatePickerFocus::Target,
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') => match state.focus {
+                DuplicatePickerFocus::Source => state.source_selected = state.source_selected.saturating_sub(1),
+                DuplicatePickerFocus::Target => state.target_selected = state.target_selected.saturating_sub(1),
+                DuplicatePickerFocus::Details => {}
+            },
+            KeyCode::Down | KeyCode::Char('j') => match state.focus {
+                DuplicatePickerFocus::Source => {
+                    state.source_selected = (state.source_selected + 1).min(sources.len().saturating_sub(1));
+                }
+                DuplicatePickerFocus::Target => {
+                    state.target_selected = (state.target_selected + 1).min(targets.len().saturating_sub(1));
+                }
+                DuplicatePickerFocus::Details => {}
+            },
+            KeyCode::Char('c') => return Ok((UploadMode::Create, None)),
+            KeyCode::Char('r') | KeyCode::Enter => {
+                return Ok((UploadMode::Replace, Some(targets[state.target_selected].clone())));
+            }
+            KeyCode::Char('s') => return Ok((UploadMode::Skip, None)),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                return Err(Error::new("Duplicate selection aborted", "target duplicate resolution cancelled"));
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn upload_cipher(session: &Session, item: &PreparedUploadItem) -> Result<String, Error> {
+    let response =
+        post_json(session, &format!("{}/api/ciphers", session.common.server), &item.payload, "upload").await?;
+    let body: Value = response.json().await.map_res("Failed to parse cipher create response")?;
+    let id = body.get("id").and_then(Value::as_str).map(str::to_owned).map_res("Cipher create response missing id")?;
+    Ok(id)
+}
+
+async fn update_cipher(session: &Session, existing: &DecryptedCipher, item: &PreparedUploadItem) -> Result<(), Error> {
+    let mut payload = item.payload.clone();
+    payload["lastKnownRevisionDate"] = existing
+        .revision_date
+        .as_ref()
+        .map(|value| Value::String(value.clone()))
+        .unwrap_or(Value::Null);
+    let response = put_json(
+        session,
+        &format!("{}/api/ciphers/{}", session.common.server, existing.id),
+        &payload,
+        "upload",
+    )
+    .await?;
+    response.error_for_status().map_res("Failed to update existing cipher")?;
+    Ok(())
+}
+
+async fn soft_delete_cipher(session: &Session, cipher_id: &str) -> Result<(), Error> {
+    let response =
+        put_json(session, &format!("{}/api/ciphers/{cipher_id}/delete", session.common.server), &json!({}), "upload")
+            .await?;
+    response.error_for_status().map_res("Failed to soft-delete uploaded cipher")?;
+    Ok(())
+}
+
+async fn restore_cipher(session: &Session, cipher_id: &str) -> Result<(), Error> {
+    let response =
+        put_json(session, &format!("{}/api/ciphers/{cipher_id}/restore", session.common.server), &json!({}), "upload")
+            .await?;
+    response.error_for_status().map_res("Failed to restore cipher")?;
+    Ok(())
+}
+
+async fn upload_cipher_attachments(
+    session: &Session,
+    cipher_id: &str,
+    item: &PreparedUploadItem,
+    attachment_index: &HashMap<(String, String), DecryptedAttachmentIndexEntry>,
+    input_dir: &Path,
+) -> Result<(), Error> {
+    for attachment in &item.attachments {
+        upload_one_attachment(
+            session,
+            cipher_id,
+            &item.source.id,
+            &item.item_key,
+            attachment,
+            attachment_index,
+            input_dir,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn local_attachment_path(input_dir: &Path, entry: &DecryptedAttachmentIndexEntry) -> PathBuf {
+    let path = PathBuf::from(&entry.output_path);
+    if path.is_absolute() {
+        path
+    } else {
+        input_dir.join(path)
+    }
+}
+
+fn canonical_fields(fields: &[DecryptedField]) -> Vec<CanonicalUploadField> {
+    fields
+        .iter()
+        .map(|field| CanonicalUploadField {
+            name: field.name.clone(),
+            value: field.value.clone(),
+            field_type: field.field_type,
+            linked_id: field.linked_id,
+        })
+        .collect()
+}
+
+fn canonical_login(login: &DecryptedLogin) -> CanonicalUploadLogin {
+    CanonicalUploadLogin {
+        username: login.username.clone(),
+        password: login.password.clone(),
+        totp: login.totp.clone(),
+        uris: login
+            .uris
+            .iter()
+            .map(|uri| CanonicalUploadUri {
+                uri: uri.uri.clone(),
+                match_type: uri.match_type,
+            })
+            .collect(),
+        password_history: login
+            .password_history
+            .iter()
+            .map(|entry| CanonicalUploadPasswordHistory {
+                password: entry.password.clone(),
+                last_used_date: entry.last_used_date.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn canonical_card(card: &DecryptedCard) -> CanonicalUploadCard {
+    CanonicalUploadCard {
+        cardholder_name: card.cardholder_name.clone(),
+        brand: card.brand.clone(),
+        number: card.number.clone(),
+        exp_month: card.exp_month.clone(),
+        exp_year: card.exp_year.clone(),
+        code: card.code.clone(),
+    }
+}
+
+fn canonical_identity(identity: &DecryptedIdentity) -> CanonicalUploadIdentity {
+    CanonicalUploadIdentity {
+        title: identity.title.clone(),
+        first_name: identity.first_name.clone(),
+        middle_name: identity.middle_name.clone(),
+        last_name: identity.last_name.clone(),
+        address1: identity.address1.clone(),
+        address2: identity.address2.clone(),
+        address3: identity.address3.clone(),
+        city: identity.city.clone(),
+        state: identity.state.clone(),
+        postal_code: identity.postal_code.clone(),
+        country: identity.country.clone(),
+        company: identity.company.clone(),
+        email: identity.email.clone(),
+        phone: identity.phone.clone(),
+        ssn: identity.ssn.clone(),
+        username: identity.username.clone(),
+        passport_number: identity.passport_number.clone(),
+        license_number: identity.license_number.clone(),
+    }
+}
+
+fn canonical_secure_note(note: &DecryptedSecureNote) -> CanonicalUploadSecureNote {
+    CanonicalUploadSecureNote { note_type: note.note_type }
+}
+
+fn canonical_ssh_key(ssh_key: &DecryptedSshKey) -> CanonicalUploadSshKey {
+    CanonicalUploadSshKey {
+        private_key: ssh_key.private_key.clone(),
+        public_key: ssh_key.public_key.clone(),
+        fingerprint: ssh_key.fingerprint.clone(),
+    }
+}
+
+fn canonical_attachments(attachments: &[DecryptedAttachment]) -> Vec<CanonicalUploadAttachment> {
+    attachments
+        .iter()
+        .map(|attachment| CanonicalUploadAttachment {
+            file_name: attachment.file_name.clone(),
+            size: attachment.size.clone(),
+        })
+        .collect()
+}
+
+fn validation_from_cipher(item: &DecryptedCipher, folder_id: Option<String>) -> ValidationCipher {
+    ValidationCipher {
+        r#type: item.r#type,
+        name: item.name.clone(),
+        notes: item.notes.clone(),
+        favorite: item.favorite,
+        folder_id,
+        deleted: item.deleted_date.is_some(),
+        fields: canonical_fields(&item.fields),
+        login: item.login.as_ref().map(canonical_login),
+        card: item.card.as_ref().map(canonical_card),
+        identity: item.identity.as_ref().map(canonical_identity),
+        secure_note: item.secure_note.as_ref().map(canonical_secure_note),
+        ssh_key: item.ssh_key.as_ref().map(canonical_ssh_key),
+        attachments: canonical_attachments(&item.attachments),
+    }
+}
+
+fn validation_from_prepared(item: &PreparedUploadItem) -> Result<ValidationCipher, Error> {
+    let source = &item.source;
+    let payload = &item.payload;
+    let login = decrypt_login(payload.get("login"), payload.get("passwordHistory"), &item.item_key)?;
+    let card = decrypt_card(payload.get("card"), &item.item_key)?;
+    let identity = decrypt_identity(payload.get("identity"), &item.item_key)?;
+    let secure_note = decrypt_secure_note(payload.get("secureNote"))?;
+    let ssh_key = decrypt_ssh_key(payload.get("sshKey"), &item.item_key)?;
+
+    Ok(ValidationCipher {
+        r#type: payload.get("type").and_then(Value::as_i64).unwrap_or(source.r#type),
+        name: decrypt_value_string(payload.get("name"), &item.item_key)?.unwrap_or_default(),
+        notes: decrypt_value_string(payload.get("notes"), &item.item_key)?,
+        favorite: payload.get("favorite").and_then(Value::as_bool),
+        folder_id: payload.get("folderId").and_then(Value::as_str).map(str::to_owned),
+        deleted: item.deleted_date.is_some(),
+        fields: canonical_fields(&decrypt_fields(payload.get("fields"), &item.item_key)?),
+        login: login.as_ref().map(canonical_login),
+        card: card.as_ref().map(canonical_card),
+        identity: identity.as_ref().map(canonical_identity),
+        secure_note: secure_note.as_ref().map(canonical_secure_note),
+        ssh_key: ssh_key.as_ref().map(canonical_ssh_key),
+        attachments: canonical_attachments(&item.attachments),
+    })
+}
+
+fn verify_prepared_upload_item(item: &PreparedUploadItem) -> Result<(), Error> {
+    let expected = validation_from_cipher(&item.source, item.payload.get("folderId").and_then(Value::as_str).map(str::to_owned));
+    let prepared = validation_from_prepared(item)?;
+    let expected_json = serde_json::to_value(&expected).unwrap_or_default();
+    let prepared_json = serde_json::to_value(&prepared).unwrap_or_default();
+    if expected_json != prepared_json {
+        return Err(Error::new(
+            "Prepared upload item failed local round-trip validation",
+            format!("{} expected={} actual={}", item.source.name, expected_json, prepared_json),
+        ));
+    }
+    Ok(())
+}
+
+async fn fetch_cipher_details(session: &Session, cipher_id: &str) -> Result<Value, Error> {
+    let url = format!("{}/api/ciphers/{cipher_id}", session.common.server);
+    let response = session
+        .client
+        .get(url)
+        .header(AUTHORIZATION, format!("Bearer {}", session.token.access_token))
+        .send()
+        .await
+        .map_res("Failed to fetch cipher details")?;
+    ensure_success_response(response, "Cipher fetch request failed", "upload", &session.common)
+        .await?
+        .json()
+        .await
+        .map_res("Failed to decode cipher details response")
+}
+
+async fn verify_uploaded_cipher(
+    session: &Session,
+    keys: &AccountKeys,
+    upload_item: &PreparedUploadItem,
+    cipher_id: &str,
+    attachment_mode: AttachmentRestoreMode,
+) -> Result<DecryptedCipher, Error> {
+    let cipher_json = fetch_cipher_details(session, cipher_id).await?;
+    let saved = decrypt_cipher(&cipher_json, keys, &session.common)?;
+    let expected_full = validation_from_cipher(
+        &upload_item.source,
+        upload_item.payload.get("folderId").and_then(Value::as_str).map(str::to_owned),
+    );
+    let actual_full = validation_from_cipher(&saved, saved.folder_id.clone());
+    let mut expected = expected_full.clone();
+    let mut actual = actual_full.clone();
+    if attachment_mode == AttachmentRestoreMode::SkipValidation {
+        expected.attachments.clear();
+        actual.attachments.clear();
+    }
+    if serde_json::to_value(&expected).unwrap_or_default() != serde_json::to_value(&actual).unwrap_or_default() {
+        return Err(Error::new(
+            "Uploaded cipher failed round-trip validation",
+            format!(
+                "cipher={} source={} expected={} actual={}",
+                cipher_id,
+                upload_item.source.name,
+                serde_json::to_value(&expected).unwrap_or_default(),
+                serde_json::to_value(&actual).unwrap_or_default()
+            ),
+        ));
+    }
+    Ok(saved)
+}
+
+async fn verify_uploaded_cipher_with_attachment_prompt(
+    session: &Session,
+    keys: &AccountKeys,
+    upload_item: &PreparedUploadItem,
+    cipher_id: &str,
+    attachment_mode: &mut AttachmentRestoreMode,
+) -> Result<DecryptedCipher, Error> {
+    match verify_uploaded_cipher(session, keys, upload_item, cipher_id, *attachment_mode).await {
+        Ok(saved) => Ok(saved),
+        Err(err) if *attachment_mode == AttachmentRestoreMode::Enforce && attachment_validation_only(&err) => {
+            if prompt_skip_attachments_on_error(&upload_item.name, &err)? {
+                *attachment_mode = AttachmentRestoreMode::SkipValidation;
+                verify_uploaded_cipher(session, keys, upload_item, cipher_id, *attachment_mode).await
+            } else {
+                Err(err)
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn attachment_validation_only(err: &Error) -> bool {
+    let text = format!("{err}");
+    text.contains("\"attachments\":[]") && text.contains("\"file_name\":")
+}
+
+async fn delete_cipher_attachment(session: &Session, cipher_id: &str, attachment_id: &str) -> Result<(), Error> {
+    let response = post_json(
+        session,
+        &format!(
+            "{}/api/ciphers/{cipher_id}/attachment/{attachment_id}/delete",
+            session.common.server
+        ),
+        &json!({}),
+        "upload",
+    )
+    .await?;
+    response.error_for_status().map_res("Failed to delete target attachment")?;
+    Ok(())
+}
+
+async fn reconcile_cipher_attachments(
+    session: &Session,
+    upload_item: &PreparedUploadItem,
+    existing: &DecryptedCipher,
+    attachment_index: &HashMap<(String, String), DecryptedAttachmentIndexEntry>,
+    input_dir: &Path,
+) -> Result<(), Error> {
+    let mut existing_by_name = existing
+        .attachments
+        .iter()
+        .map(|attachment| (attachment.file_name.clone(), attachment.clone()))
+        .collect::<HashMap<_, _>>();
+
+    for attachment in &upload_item.attachments {
+        match existing_by_name.remove(&attachment.file_name) {
+            Some(target_attachment) if target_attachment.size == attachment.size => {}
+            Some(target_attachment) => {
+                delete_cipher_attachment(session, &existing.id, &target_attachment.id).await?;
+                upload_one_attachment(session, &existing.id, &upload_item.source.id, &upload_item.item_key, attachment, attachment_index, input_dir)
+                    .await?;
+            }
+            None => {
+                upload_one_attachment(session, &existing.id, &upload_item.source.id, &upload_item.item_key, attachment, attachment_index, input_dir)
+                    .await?;
+            }
+        }
+    }
+
+    for stale in existing_by_name.into_values() {
+        delete_cipher_attachment(session, &existing.id, &stale.id).await?;
+    }
+    Ok(())
+}
+
+async fn upload_one_attachment(
+    session: &Session,
+    cipher_id: &str,
+    source_cipher_id: &str,
+    item_key: &SymmetricKey,
+    attachment: &DecryptedAttachment,
+    attachment_index: &HashMap<(String, String), DecryptedAttachmentIndexEntry>,
+    input_dir: &Path,
+) -> Result<(), Error> {
+    let key = (source_cipher_id.to_owned(), attachment.id.clone());
+    let index_entry = attachment_index.get(&key).cloned().ok_or_else(|| {
+        Error::new(
+            "Missing decrypted attachment index entry",
+            format!("{source_cipher_id} / {}", attachment.id),
+        )
+    })?;
+    let source_path = local_attachment_path(input_dir, &index_entry);
+    let bytes = fs::read(&source_path).await.map_err(|e| {
+        Error::new(format!("Failed to read decrypted attachment {}", source_path.display()), e.to_string())
+    })?;
+    let attachment_key = generate_random_symmetric_key();
+    let encrypted_name = encrypt_string_value(&attachment.file_name, item_key);
+    let encrypted_key = encrypt_string_value_raw(&attachment_key.to_bytes(), item_key);
+    let encrypted_bytes = encrypt_bytes_with_key(&bytes, &attachment_key)?;
+    let file_size = attachment.size.clone().unwrap_or_else(|| bytes.len().to_string());
+
+    let response = post_json(
+        session,
+        &format!("{}/api/ciphers/{cipher_id}/attachment/v2", session.common.server),
+        &json!({
+            "key": encrypted_key,
+            "fileName": encrypted_name,
+            "fileSize": file_size,
+            "adminRequest": false,
+        }),
+        "upload",
+    )
+    .await?;
+    let response_json: Value = response.json().await.map_res("Failed to parse attachment create response")?;
+    let attachment_id = response_json
+        .get("attachmentId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .map_res("Attachment create response missing attachmentId")?;
+    let upload_url = response_json
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .map_res("Attachment create response missing url")?;
+    let upload_url = normalize_attachment_upload_url(&upload_url);
+
+    let part = Part::bytes(encrypted_bytes).file_name(attachment.file_name.clone());
+    let form = Form::new().part("data", part);
+    let response = session
+        .client
+        .post(format!("{}{}", session.common.server, upload_url))
+        .header(AUTHORIZATION, format!("Bearer {}", session.token.access_token))
+        .multipart(form)
+        .send()
+        .await
+        .map_res("Failed to upload encrypted attachment data")?;
+    ensure_success_response(response, "Attachment upload request failed", "upload", &session.common).await?;
+
+    log_verbose(
+        "upload",
+        &session.common,
+        format!("Uploaded attachment {} for cipher {}", attachment_id, cipher_id),
+    );
+    Ok(())
+}
+
+fn normalize_attachment_upload_url(upload_url: &str) -> String {
+    if upload_url.starts_with("/api/") {
+        upload_url.to_owned()
+    } else if upload_url.starts_with("/ciphers/") {
+        format!("/api{upload_url}")
+    } else {
+        upload_url.to_owned()
+    }
+}
+
+fn prompt_skip_attachments_on_error(item_name: &str, err: &Error) -> Result<bool, Error> {
+    eprintln!("\nAttachment upload failed for item: {item_name}");
+    eprintln!("{err}");
+    eprintln!("Choose how to continue:");
+    eprintln!("  [s] skip all remaining attachment uploads and continue restoring items");
+    eprintln!("  [a] abort upload");
+
+    loop {
+        eprint!("Continue [s/a]: ");
+        io::stdout().flush().map_res("Failed to flush attachment prompt")?;
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| Error::new("Failed to read attachment prompt input", e.to_string()))?;
+        match input.trim().to_ascii_lowercase().as_str() {
+            "s" | "skip" => return Ok(true),
+            "a" | "abort" => return Ok(false),
+            _ => eprintln!("Please enter s or a."),
+        }
+    }
+}
+
+fn encrypt_fields(fields: &[DecryptedField], key: &SymmetricKey) -> Option<Value> {
+    if fields.is_empty() {
+        return None;
+    }
+
+    Some(Value::Array(
+        fields
+            .iter()
+            .map(|field| {
+                json!({
+                    "name": field.name.as_deref().map(|value| encrypt_string_value(value, key)),
+                    "value": field.value.as_deref().map(|value| encrypt_string_value(value, key)),
+                    "type": field.field_type,
+                    "linkedId": field.linked_id,
+                })
+            })
+            .collect(),
+    ))
+}
+
+fn encrypt_login(login: Option<&DecryptedLogin>, key: &SymmetricKey) -> Option<Value> {
+    let login = login?;
+    Some(json!({
+        "username": login.username.as_deref().map(|value| encrypt_string_value(value, key)),
+        "password": login.password.as_deref().map(|value| encrypt_string_value(value, key)),
+        "totp": login.totp.as_deref().map(|value| encrypt_string_value(value, key)),
+        "uris": login.uris.iter().map(|uri| json!({
+            "uri": uri.uri.as_deref().map(|value| encrypt_string_value(value, key)),
+            "match": uri.match_type,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+fn encrypt_password_history(login: Option<&DecryptedLogin>, key: &SymmetricKey) -> Option<Value> {
+    let login = login?;
+    if login.password_history.is_empty() {
+        return None;
+    }
+
+    Some(Value::Array(
+        login
+            .password_history
+            .iter()
+            .map(|entry| {
+                json!({
+                    "password": entry.password.as_deref().map(|value| encrypt_string_value(value, key)),
+                    "lastUsedDate": entry.last_used_date.clone(),
+                })
+            })
+            .collect(),
+    ))
+}
+
+fn encrypt_card(card: Option<&DecryptedCard>, key: &SymmetricKey) -> Option<Value> {
+    let card = card?;
+    Some(json!({
+        "cardholderName": card.cardholder_name.as_deref().map(|value| encrypt_string_value(value, key)),
+        "brand": card.brand.as_deref().map(|value| encrypt_string_value(value, key)),
+        "number": card.number.as_deref().map(|value| encrypt_string_value(value, key)),
+        "expMonth": card.exp_month.as_deref().map(|value| encrypt_string_value(value, key)),
+        "expYear": card.exp_year.as_deref().map(|value| encrypt_string_value(value, key)),
+        "code": card.code.as_deref().map(|value| encrypt_string_value(value, key)),
+    }))
+}
+
+fn encrypt_identity(identity: Option<&DecryptedIdentity>, key: &SymmetricKey) -> Option<Value> {
+    let identity = identity?;
+    Some(json!({
+        "title": identity.title.as_deref().map(|value| encrypt_string_value(value, key)),
+        "firstName": identity.first_name.as_deref().map(|value| encrypt_string_value(value, key)),
+        "middleName": identity.middle_name.as_deref().map(|value| encrypt_string_value(value, key)),
+        "lastName": identity.last_name.as_deref().map(|value| encrypt_string_value(value, key)),
+        "address1": identity.address1.as_deref().map(|value| encrypt_string_value(value, key)),
+        "address2": identity.address2.as_deref().map(|value| encrypt_string_value(value, key)),
+        "address3": identity.address3.as_deref().map(|value| encrypt_string_value(value, key)),
+        "city": identity.city.as_deref().map(|value| encrypt_string_value(value, key)),
+        "state": identity.state.as_deref().map(|value| encrypt_string_value(value, key)),
+        "postalCode": identity.postal_code.as_deref().map(|value| encrypt_string_value(value, key)),
+        "country": identity.country.as_deref().map(|value| encrypt_string_value(value, key)),
+        "company": identity.company.as_deref().map(|value| encrypt_string_value(value, key)),
+        "email": identity.email.as_deref().map(|value| encrypt_string_value(value, key)),
+        "phone": identity.phone.as_deref().map(|value| encrypt_string_value(value, key)),
+        "ssn": identity.ssn.as_deref().map(|value| encrypt_string_value(value, key)),
+        "username": identity.username.as_deref().map(|value| encrypt_string_value(value, key)),
+        "passportNumber": identity.passport_number.as_deref().map(|value| encrypt_string_value(value, key)),
+        "licenseNumber": identity.license_number.as_deref().map(|value| encrypt_string_value(value, key)),
+    }))
+}
+
+fn encrypt_secure_note(note: Option<&DecryptedSecureNote>) -> Option<Value> {
+    note.map(|note| {
+        json!({
+            "type": note.note_type,
+        })
+    })
+}
+
+fn encrypt_ssh_key(ssh_key: Option<&DecryptedSshKey>, key: &SymmetricKey) -> Option<Value> {
+    let ssh_key = ssh_key?;
+    Some(json!({
+        "privateKey": ssh_key.private_key.as_deref().map(|value| encrypt_string_value(value, key)),
+        "publicKey": ssh_key.public_key.as_deref().map(|value| encrypt_string_value(value, key)),
+        "fingerprint": ssh_key.fingerprint.as_deref().map(|value| encrypt_string_value(value, key)),
+    }))
+}
+
+fn encrypt_string_value(value: &str, key: &SymmetricKey) -> String {
+    encrypt_cipher_string_to_string(value.as_bytes(), key)
+}
+
+fn encrypt_string_value_raw(value: &[u8], key: &SymmetricKey) -> String {
+    encrypt_cipher_string_to_string(value, key)
+}
+
+fn encrypt_cipher_string_to_string(plaintext: &[u8], key: &SymmetricKey) -> String {
+    let iv = crypto::get_random_bytes::<16>();
+    let ciphertext = encrypt(Cipher::aes_256_cbc(), &key.enc, Some(&iv), plaintext).expect("AES-CBC encryption failed");
+    if let Some(mac_key) = &key.mac {
+        let mut input = Vec::with_capacity(iv.len() + ciphertext.len());
+        input.extend_from_slice(&iv);
+        input.extend_from_slice(&ciphertext);
+        let mac = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, mac_key), &input);
+        format!("2.{}|{}|{}", BASE64.encode(&iv), BASE64.encode(&ciphertext), BASE64.encode(mac.as_ref()))
+    } else {
+        format!("0.{}|{}", BASE64.encode(&iv), BASE64.encode(&ciphertext))
+    }
+}
+
+fn encrypt_bytes_with_key(plaintext: &[u8], key: &SymmetricKey) -> Result<Vec<u8>, Error> {
+    let iv = crypto::get_random_bytes::<16>();
+    let ciphertext =
+        encrypt(Cipher::aes_256_cbc(), &key.enc, Some(&iv), plaintext).map_res("AES-CBC encryption failed")?;
+    let mut output = Vec::with_capacity(1 + iv.len() + ciphertext.len() + 32);
+    if let Some(mac_key) = &key.mac {
+        let mut input = Vec::with_capacity(iv.len() + ciphertext.len());
+        input.extend_from_slice(&iv);
+        input.extend_from_slice(&ciphertext);
+        let mac = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, mac_key), &input);
+        output.push(2);
+        output.extend_from_slice(&iv);
+        output.extend_from_slice(mac.as_ref());
+        output.extend_from_slice(&ciphertext);
+    } else {
+        output.push(0);
+        output.extend_from_slice(&iv);
+        output.extend_from_slice(&ciphertext);
+    }
+    Ok(output)
+}
+
+fn generate_random_symmetric_key() -> SymmetricKey {
+    SymmetricKey::from_bytes(crypto::get_random_bytes::<64>().to_vec()).expect("generated symmetric key length")
 }
 
 async fn run_tui(args: TuiArgs) -> Result<(), Error> {
@@ -939,6 +2489,11 @@ fn build_item_detail_lines(item: &DecryptedCipher) -> Vec<Line<'static>> {
         ]),
     ];
 
+    push_optional_line(&mut lines, "folderId", item.folder_id.clone());
+    push_optional_line(&mut lines, "deletedDate", item.deleted_date.clone());
+    push_optional_line(&mut lines, "creationDate", item.creation_date.clone());
+    push_optional_line(&mut lines, "revisionDate", item.revision_date.clone());
+
     if let Some(notes) = &item.notes {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled("notes", Style::default().add_modifier(Modifier::BOLD))));
@@ -956,6 +2511,53 @@ fn build_item_detail_lines(item: &DecryptedCipher) -> Vec<Line<'static>> {
         for uri in &login.uris {
             push_optional_line(&mut lines, "uri", uri.uri.clone());
         }
+        for history in &login.password_history {
+            let password = history.password.clone().unwrap_or_default();
+            let last_used = history.last_used_date.clone().unwrap_or_default();
+            lines.push(Line::from(format!("history: {password} [{last_used}]")));
+        }
+    }
+
+    if let Some(card) = &item.card {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("card", Style::default().add_modifier(Modifier::BOLD))));
+        push_optional_line(&mut lines, "cardholder", card.cardholder_name.clone());
+        push_optional_line(&mut lines, "brand", card.brand.clone());
+        push_optional_line(&mut lines, "number", card.number.clone());
+        push_optional_line(&mut lines, "expMonth", card.exp_month.clone());
+        push_optional_line(&mut lines, "expYear", card.exp_year.clone());
+        push_optional_line(&mut lines, "code", card.code.clone());
+    }
+
+    if let Some(identity) = &item.identity {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("identity", Style::default().add_modifier(Modifier::BOLD))));
+        push_optional_line(&mut lines, "title", identity.title.clone());
+        push_optional_line(&mut lines, "firstName", identity.first_name.clone());
+        push_optional_line(&mut lines, "middleName", identity.middle_name.clone());
+        push_optional_line(&mut lines, "lastName", identity.last_name.clone());
+        push_optional_line(&mut lines, "address1", identity.address1.clone());
+        push_optional_line(&mut lines, "address2", identity.address2.clone());
+        push_optional_line(&mut lines, "address3", identity.address3.clone());
+        push_optional_line(&mut lines, "city", identity.city.clone());
+        push_optional_line(&mut lines, "state", identity.state.clone());
+        push_optional_line(&mut lines, "postalCode", identity.postal_code.clone());
+        push_optional_line(&mut lines, "country", identity.country.clone());
+        push_optional_line(&mut lines, "company", identity.company.clone());
+        push_optional_line(&mut lines, "email", identity.email.clone());
+        push_optional_line(&mut lines, "phone", identity.phone.clone());
+        push_optional_line(&mut lines, "ssn", identity.ssn.clone());
+        push_optional_line(&mut lines, "username", identity.username.clone());
+        push_optional_line(&mut lines, "passport", identity.passport_number.clone());
+        push_optional_line(&mut lines, "license", identity.license_number.clone());
+    }
+
+    if let Some(ssh_key) = &item.ssh_key {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("sshKey", Style::default().add_modifier(Modifier::BOLD))));
+        push_optional_line(&mut lines, "privateKey", ssh_key.private_key.clone());
+        push_optional_line(&mut lines, "publicKey", ssh_key.public_key.clone());
+        push_optional_line(&mut lines, "fingerprint", ssh_key.fingerprint.clone());
     }
 
     if !item.fields.is_empty() {
@@ -977,6 +2579,120 @@ fn build_item_detail_lines(item: &DecryptedCipher) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn render_source_duplicate_picker(frame: &mut Frame<'_>, items: &[DecryptedCipher], selected: usize) {
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(frame.size());
+    let help = Paragraph::new("Duplicate source items: use ↑/↓ to inspect, Enter to keep one, q to cancel")
+        .block(Block::default().borders(Borders::ALL).title("Upload Duplicate Resolution"));
+    frame.render_widget(help, root[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .split(root[1]);
+
+    let items_list = items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| ListItem::new(format!("{} {}", idx + 1, item.name)))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(selected));
+    let list = List::new(items_list)
+        .block(Block::default().borders(Borders::ALL).title("Source Candidates"))
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .highlight_symbol(">> ");
+    frame.render_stateful_widget(list, body[0], &mut state);
+
+    let lines = build_item_detail_lines(&items[selected]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Details"))
+            .wrap(Wrap { trim: false }),
+        body[1],
+    );
+}
+
+fn render_target_duplicate_picker(
+    frame: &mut Frame<'_>,
+    sources: &[DecryptedCipher],
+    targets: &[DecryptedCipher],
+    state: &DuplicatePickerState,
+) {
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(frame.size());
+    let help =
+        Paragraph::new("Source vs target duplicate: Tab switches panes, c=create duplicate, r/Enter=replace target, s=skip, q=cancel")
+            .block(Block::default().borders(Borders::ALL).title("Upload Duplicate Resolution"));
+    frame.render_widget(help, root[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(25), Constraint::Percentage(25), Constraint::Percentage(50)])
+        .split(root[1]);
+
+    let source_items = sources
+        .iter()
+        .map(|item| ListItem::new(item.name.clone()))
+        .collect::<Vec<_>>();
+    let target_items = targets
+        .iter()
+        .map(|item| ListItem::new(format!("{} ({})", item.name, item.id)))
+        .collect::<Vec<_>>();
+
+    let source_title = if state.focus == DuplicatePickerFocus::Source {
+        "Source [focused]"
+    } else {
+        "Source"
+    };
+    let target_title = if state.focus == DuplicatePickerFocus::Target {
+        "Target [focused]"
+    } else {
+        "Target"
+    };
+    let details_title = if state.focus == DuplicatePickerFocus::Details {
+        "Details [focused]"
+    } else {
+        "Details"
+    };
+
+    let mut source_state = ListState::default().with_selected(Some(state.source_selected));
+    frame.render_stateful_widget(
+        List::new(source_items)
+            .block(Block::default().borders(Borders::ALL).title(source_title))
+            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .highlight_symbol(">> "),
+        body[0],
+        &mut source_state,
+    );
+
+    let mut target_state = ListState::default().with_selected(Some(state.target_selected));
+    frame.render_stateful_widget(
+        List::new(target_items)
+            .block(Block::default().borders(Borders::ALL).title(target_title))
+            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .highlight_symbol(">> "),
+        body[1],
+        &mut target_state,
+    );
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled("Incoming Source", Style::default().add_modifier(Modifier::BOLD))));
+    lines.extend(build_item_detail_lines(&sources[state.source_selected]));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("Existing Target", Style::default().add_modifier(Modifier::BOLD))));
+    lines.extend(build_item_detail_lines(&targets[state.target_selected]));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(details_title))
+            .wrap(Wrap { trim: false }),
+        body[2],
+    );
 }
 
 fn push_optional_line(lines: &mut Vec<Line<'static>>, label: &str, value: Option<String>) {
@@ -1370,6 +3086,49 @@ fn decrypt_export(sync: &Value, keys: &AccountKeys, common: &CommonArgs) -> Resu
     })
 }
 
+fn decrypt_export_lossy(sync: &Value, keys: &AccountKeys, common: &CommonArgs) -> DecryptedExport {
+    let folders = sync
+        .get("folders")
+        .and_then(Value::as_array)
+        .map(|folders| {
+            folders
+                .iter()
+                .filter_map(|folder| {
+                    let id = folder.get("id").and_then(Value::as_str)?;
+                    let name_enc = folder.get("name").and_then(Value::as_str)?;
+                    let name = decrypt_cipher_string_to_string(name_enc, &keys.user_key, None).ok()?;
+                    Some(DecryptedFolder {
+                        id: id.to_owned(),
+                        name,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut items = Vec::new();
+    for cipher in sync.get("ciphers").and_then(Value::as_array).into_iter().flatten() {
+        match decrypt_cipher(cipher, keys, common) {
+            Ok(item) => items.push(item),
+            Err(err) => {
+                let cipher_id = cipher.get("id").and_then(Value::as_str).unwrap_or("<unknown>");
+                let cipher_type = cipher.get("type").and_then(Value::as_i64).unwrap_or_default();
+                log_info(
+                    "upload",
+                    common,
+                    format!("Skipping undecryptable target cipher id={cipher_id} type={} reason={err}", cipher_type),
+                );
+            }
+        }
+    }
+
+    DecryptedExport {
+        encrypted: false,
+        folders,
+        items,
+    }
+}
+
 fn decrypt_cipher(cipher: &Value, keys: &AccountKeys, common: &CommonArgs) -> Result<DecryptedCipher, Error> {
     let id = get_required_str(cipher, "id")?.to_owned();
     let cipher_type = cipher.get("type").and_then(Value::as_i64).map_res("Cipher missing type")?;
@@ -1489,6 +3248,9 @@ fn decrypt_login(
     let Some(login) = value else {
         return Ok(None);
     };
+    if login.is_null() {
+        return Ok(None);
+    }
 
     let uris = login
         .get("uris")
@@ -1535,6 +3297,9 @@ fn decrypt_card(value: Option<&Value>, key: &SymmetricKey) -> Result<Option<Decr
     let Some(card) = value else {
         return Ok(None);
     };
+    if card.is_null() {
+        return Ok(None);
+    }
 
     Ok(Some(DecryptedCard {
         cardholder_name: decrypt_value_string(card.get("cardholderName"), key)?,
@@ -1550,6 +3315,9 @@ fn decrypt_identity(value: Option<&Value>, key: &SymmetricKey) -> Result<Option<
     let Some(identity) = value else {
         return Ok(None);
     };
+    if identity.is_null() {
+        return Ok(None);
+    }
 
     Ok(Some(DecryptedIdentity {
         title: decrypt_value_string(identity.get("title"), key)?,
@@ -1577,6 +3345,9 @@ fn decrypt_secure_note(value: Option<&Value>) -> Result<Option<DecryptedSecureNo
     let Some(note) = value else {
         return Ok(None);
     };
+    if note.is_null() {
+        return Ok(None);
+    }
     Ok(Some(DecryptedSecureNote {
         note_type: note.get("type").and_then(Value::as_i64),
     }))
@@ -1586,6 +3357,9 @@ fn decrypt_ssh_key(value: Option<&Value>, key: &SymmetricKey) -> Result<Option<D
     let Some(ssh_key) = value else {
         return Ok(None);
     };
+    if ssh_key.is_null() {
+        return Ok(None);
+    }
 
     Ok(Some(DecryptedSshKey {
         private_key: decrypt_value_string(ssh_key.get("privateKey"), key)?,
@@ -1992,6 +3766,14 @@ impl SymmetricKey {
             len => Err(Error::new("Unsupported symmetric key length", len.to_string())),
         }
     }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.enc.clone();
+        if let Some(mac) = &self.mac {
+            bytes.extend_from_slice(mac);
+        }
+        bytes
+    }
 }
 
 fn decrypt_optional_string_field(value: &Value, field: &str, key: &SymmetricKey) -> Result<Option<String>, Error> {
@@ -2200,6 +3982,30 @@ async fn ensure_success_response(
     Err(Error::new(format!("{context} ({status})"), body))
 }
 
+async fn post_json(session: &Session, url: &str, body: &Value, tag: &str) -> Result<reqwest::Response, Error> {
+    let response = session
+        .client
+        .post(url)
+        .header(AUTHORIZATION, format!("Bearer {}", session.token.access_token))
+        .json(body)
+        .send()
+        .await
+        .map_res("Failed to send POST request")?;
+    ensure_success_response(response, "POST request failed", tag, &session.common).await
+}
+
+async fn put_json(session: &Session, url: &str, body: &Value, tag: &str) -> Result<reqwest::Response, Error> {
+    let response = session
+        .client
+        .put(url)
+        .header(AUTHORIZATION, format!("Bearer {}", session.token.access_token))
+        .json(body)
+        .send()
+        .await
+        .map_res("Failed to send PUT request")?;
+    ensure_success_response(response, "PUT request failed", tag, &session.common).await
+}
+
 fn resolve_master_password(master_password: Option<String>, prompt: &str) -> Result<String, Error> {
     match master_password {
         Some(password) => Ok(password),
@@ -2303,10 +4109,13 @@ pub fn print_version_and_exit() -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_attachment_downloads, decrypt_aes_cbc, decrypt_bytes_with_key, decrypt_cipher_string_to_bytes,
-        generate_totp_code, hkdf_expand_from_prk_32, normalize_base_url, normalize_client_id, normalize_uri_host,
-        parse_cipher_string, parse_totp_value, path_to_forward_slashes, sanitize_file_name,
-        seconds_remaining_in_period, SymmetricKey, TotpAlgorithm,
+        build_existing_signatures, collect_attachment_downloads, decrypt_aes_cbc, decrypt_bytes_with_key,
+        decrypt_cipher_string_to_bytes, generate_totp_code, hkdf_expand_from_prk_32, normalize_base_url,
+        normalize_client_id, normalize_uri_host, normalize_attachment_upload_url, parse_cipher_string,
+        parse_totp_value, path_to_forward_slashes, prepare_upload_item, sanitize_file_name,
+        verify_prepared_upload_item, DecryptedCipher, DecryptedExport, DecryptedField, DecryptedFolder,
+        DecryptedLogin, DecryptedPasswordHistory, DecryptedUri, SymmetricKey, TotpAlgorithm,
+        seconds_remaining_in_period,
     };
     use data_encoding::BASE64;
     use openssl::symm::{encrypt, Cipher};
@@ -2519,5 +4328,84 @@ mod tests {
         assert_eq!(seconds_remaining_in_period(30, 29), 1);
         assert_eq!(seconds_remaining_in_period(30, 30), 30);
         assert_eq!(seconds_remaining_in_period(30, 31), 29);
+    }
+
+    fn sample_cipher(id: &str, folder_id: &str) -> DecryptedCipher {
+        DecryptedCipher {
+            id: id.to_owned(),
+            r#type: 1,
+            name: "Example".to_owned(),
+            notes: Some("notes".to_owned()),
+            favorite: Some(true),
+            folder_id: Some(folder_id.to_owned()),
+            organization_id: None,
+            collection_ids: Vec::new(),
+            deleted_date: None,
+            creation_date: None,
+            revision_date: None,
+            fields: vec![DecryptedField {
+                name: Some("field".to_owned()),
+                value: Some("value".to_owned()),
+                field_type: Some(1),
+                linked_id: None,
+            }],
+            attachments: Vec::new(),
+            login: Some(DecryptedLogin {
+                username: Some("user@example.com".to_owned()),
+                password: Some("super-secret".to_owned()),
+                totp: None,
+                uris: vec![DecryptedUri {
+                    uri: Some("https://example.com".to_owned()),
+                    match_type: Some(0),
+                }],
+                password_history: vec![DecryptedPasswordHistory {
+                    password: Some("old-secret".to_owned()),
+                    last_used_date: Some("2024-01-01T00:00:00.000000Z".to_owned()),
+                }],
+            }),
+            card: None,
+            identity: None,
+            secure_note: None,
+            ssh_key: None,
+            search_blob: String::new(),
+            search_domains: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn build_existing_signatures_groups_duplicates() {
+        let folder = DecryptedFolder {
+            id: "folder-1".to_owned(),
+            name: "Logins".to_owned(),
+        };
+        let export = DecryptedExport {
+            encrypted: false,
+            folders: vec![folder.clone()],
+            items: vec![sample_cipher("a", &folder.id), sample_cipher("b", &folder.id)],
+        };
+
+        let signatures = build_existing_signatures(&export, &[folder]);
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures.values().next().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn prepare_upload_item_round_trips_locally() {
+        let source = sample_cipher("cipher-1", "folder-1");
+        let key = SymmetricKey::from_bytes((0..64).map(|i| i as u8).collect()).unwrap();
+        let upload = prepare_upload_item(&source, Some("target-folder".to_owned()), &key);
+        verify_prepared_upload_item(&upload).unwrap();
+    }
+
+    #[test]
+    fn normalize_attachment_upload_url_prefixes_api_mount() {
+        assert_eq!(
+            normalize_attachment_upload_url("/ciphers/abc/attachment/def"),
+            "/api/ciphers/abc/attachment/def"
+        );
+        assert_eq!(
+            normalize_attachment_upload_url("/api/ciphers/abc/attachment/def"),
+            "/api/ciphers/abc/attachment/def"
+        );
     }
 }
