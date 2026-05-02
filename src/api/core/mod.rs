@@ -19,6 +19,7 @@ pub fn routes() -> Vec<Route> {
     let mut eq_domains_routes = routes![get_eq_domains, post_eq_domains, put_eq_domains];
     let mut hibp_routes = routes![hibp_breach];
     let mut meta_routes = routes![alive, now, version, config];
+    let mut tools_routes = routes![tools_stats];
 
     let mut routes = Vec::new();
     routes.append(&mut accounts::routes());
@@ -33,6 +34,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut eq_domains_routes);
     routes.append(&mut hibp_routes);
     routes.append(&mut meta_routes);
+    routes.append(&mut tools_routes);
 
     routes
 }
@@ -52,7 +54,10 @@ use rocket::{serde::json::Json, serde::json::Value, Catcher, Route};
 use crate::{
     api::{JsonResult, Notify, UpdateType},
     auth::Headers,
-    db::DbConn,
+    db::{
+        models::{Attachment, Cipher, Collection, Folder, Send},
+        DbConn,
+    },
     error::Error,
     http_client::make_http_request,
     util::parse_experimental_client_feature_flags,
@@ -232,5 +237,65 @@ fn api_not_found() -> Json<Value> {
             "reason": "Not Found",
             "description": "The requested resource could not be found."
         }
+    }))
+}
+
+#[get("/tools/stats")]
+async fn tools_stats(headers: Headers, mut conn: DbConn) -> Json<Value> {
+    let ciphers = Cipher::find_by_user_visible(&headers.user.uuid, &mut conn).await;
+    let folders = Folder::find_by_user(&headers.user.uuid, &mut conn).await;
+    let collections = Collection::find_by_user_uuid(headers.user.uuid.clone(), &mut conn).await;
+    let sends = Send::find_by_user(&headers.user.uuid, &mut conn).await;
+
+    let mut ciphers_by_type: serde_json::Map<String, Value> = serde_json::Map::new();
+    let mut attachment_count = 0usize;
+    let mut total_attachment_bytes = 0i64;
+    let mut items_with_attachments = 0usize;
+    let mut trashed_count = 0usize;
+    let mut organization_owned_count = 0usize;
+    let mut personal_owned_count = 0usize;
+
+    for cipher in &ciphers {
+        let type_name = match cipher.atype {
+            1 => "login",
+            2 => "secureNote",
+            3 => "card",
+            4 => "identity",
+            5 => "sshKey",
+            _ => "unknown",
+        };
+        let current = ciphers_by_type.get(type_name).and_then(Value::as_u64).unwrap_or(0);
+        ciphers_by_type.insert(type_name.to_owned(), json!(current + 1));
+
+        if cipher.deleted_at.is_some() {
+            trashed_count += 1;
+        }
+        if cipher.organization_uuid.is_some() {
+            organization_owned_count += 1;
+        } else {
+            personal_owned_count += 1;
+        }
+
+        let attachments = Attachment::find_by_cipher(&cipher.uuid, &mut conn).await;
+        if !attachments.is_empty() {
+            items_with_attachments += 1;
+        }
+        attachment_count += attachments.len();
+        total_attachment_bytes += attachments.iter().map(|attachment| attachment.file_size).sum::<i64>();
+    }
+
+    Json(json!({
+        "object": "toolsStats",
+        "totalCiphers": ciphers.len(),
+        "ciphersByType": ciphers_by_type,
+        "folderCount": folders.len(),
+        "collectionCount": collections.len(),
+        "sendCount": sends.len(),
+        "attachmentCount": attachment_count,
+        "totalAttachmentBytes": total_attachment_bytes.max(0),
+        "itemsWithAttachments": items_with_attachments,
+        "trashedCount": trashed_count,
+        "organizationOwnedCount": organization_owned_count,
+        "personalOwnedCount": personal_owned_count,
     }))
 }
