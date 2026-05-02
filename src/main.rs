@@ -47,6 +47,7 @@ use tokio::signal::unix::SignalKind;
 mod error;
 mod api;
 mod auth;
+mod cli;
 mod config;
 mod crypto;
 #[macro_use]
@@ -62,12 +63,12 @@ use crate::api::{WS_ANONYMOUS_SUBSCRIPTIONS, WS_USERS};
 pub use config::CONFIG;
 pub use error::{Error, MapResult};
 use rocket::data::{Limits, ToByteUnit};
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::Arc;
 pub use util::is_running_in_container;
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
-    parse_args();
+    parse_args().await?;
     launch_info();
 
     let level = init_logging()?;
@@ -106,7 +107,9 @@ COMMAND:
     hash [--preset {bitwarden|owasp}]  Generate an Argon2id PHC ADMIN_TOKEN
     backup                             Create a backup of the SQLite database
                                        You can also send the USR1 signal to trigger a backup
+";
 
+const HELP_PRESETS: &str = "\
 PRESETS:                  m=         t=          p=
     bitwarden (default) 64MiB, 3 Iterations, 4 Threads
     owasp               19MiB, 2 Iterations, 1 Thread
@@ -115,20 +118,17 @@ PRESETS:                  m=         t=          p=
 
 pub const VERSION: Option<&str> = option_env!("VW_VERSION");
 
-fn parse_args() {
+pub(crate) fn help_text() -> String {
+    format!("{HELP}{}{HELP_PRESETS}", cli::DUMP_HELP)
+}
+
+async fn parse_args() -> Result<(), Error> {
     let mut pargs = pico_args::Arguments::from_env();
-    let version = VERSION.unwrap_or("(Version info from Git not present)");
 
     if pargs.contains(["-h", "--help"]) {
-        println!("Vaultwarden {version}");
-        print!("{HELP}");
-        exit(0);
+        cli::print_help_and_exit();
     } else if pargs.contains(["-v", "--version"]) {
-        config::SKIP_CONFIG_VALIDATION.store(true, Ordering::Relaxed);
-        let web_vault_version = util::get_web_vault_version();
-        println!("Vaultwarden {version}");
-        println!("Web-Vault {web_vault_version}");
-        exit(0);
+        cli::print_version_and_exit();
     }
 
     if let Some(command) = pargs.subcommand().unwrap_or_default() {
@@ -196,9 +196,13 @@ fn parse_args() {
                     exit(1);
                 }
             }
+        } else {
+            cli::handle_command(&command, &mut pargs).await?;
         }
         exit(0);
     }
+
+    Ok(())
 }
 
 fn backup_sqlite() -> Result<String, Error> {
